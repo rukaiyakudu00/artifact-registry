@@ -159,3 +159,163 @@
     (var-get platform-paused)
 )
 
+;; Public Functions
+
+;; Register as a cultural institution
+(define-public (register-institution)
+    (let (
+        (existing-institution (map-get? cultural-institutions tx-sender))
+        (current-height block-height)
+    )
+    (asserts! (not (var-get platform-paused)) ERR_ACCESS_DENIED)
+    (asserts! (is-none existing-institution) ERR_DUPLICATE_RECORD)
+    (map-set cultural-institutions tx-sender
+        {
+            verified: true,
+            artifact-count: u0,
+            reputation-score: u100,
+            active-status: true,
+            registration-height: current-height,
+            last-update-height: current-height,
+            total-earnings: u0
+        }
+    )
+    (ok true))
+)
+
+;; Register as an artifact verifier
+(define-public (register-verifier (specialization (string-ascii 64)))
+    (let (
+        (existing-verifier (map-get? verifiers tx-sender))
+        (current-height block-height)
+    )
+    (asserts! (not (var-get platform-paused)) ERR_ACCESS_DENIED)
+    (asserts! (is-none existing-verifier) ERR_DUPLICATE_RECORD)
+    (map-set verifiers tx-sender
+        {
+            has-active-verification: false,
+            verified-artifact-id: u0,
+            verification-scope: "",
+            annual-fee: u0,
+            verification-start-height: u0,
+            verification-end-height: u0,
+            total-verified-artifacts: u0,
+            last-verification-height: u0,
+            specialization: specialization,
+            reputation-score: u300
+        }
+    )
+    (ok true))
+)
+
+;; Register a cultural artifact
+(define-public (register-cultural-artifact 
+    (historical-period (string-ascii 64)) 
+    (verification-fee uint) 
+    (acquisition-price uint)
+    (min-term uint)
+    (max-term uint)
+    (artifact-metadata (string-ascii 256))
+    (discovery-location (string-ascii 128))
+    (carbon-dated bool)
+)
+    (let (
+        (institution-info (unwrap! (map-get? cultural-institutions tx-sender) ERR_RECORD_NOT_FOUND))
+        (new-artifact-id (var-get total-registered-artifacts))
+        (current-height block-height)
+    )
+    (asserts! (not (var-get platform-paused)) ERR_ACCESS_DENIED)
+    (asserts! (get verified institution-info) ERR_ACCESS_DENIED)
+    (asserts! (get active-status institution-info) ERR_ACCESS_DENIED)
+    (asserts! (< (get artifact-count institution-info) MAX_ARTIFACTS_PER_INSTITUTION) ERR_LIMIT_REACHED)
+    (asserts! (validate-verification-fee verification-fee) ERR_INVALID_RATE)
+    (asserts! (validate-acquisition-price acquisition-price) ERR_PAYMENT_INVALID)
+    (asserts! (>= max-term min-term) ERR_INVALID_DURATION)
+    (asserts! (validate-period historical-period) ERR_INVALID_PERIOD)
+    (asserts! (validate-metadata artifact-metadata) ERR_INVALID_METADATA)
+    (asserts! (validate-location discovery-location) ERR_INVALID_LOCATION)
+    
+    (map-set cultural-artifacts new-artifact-id
+        {
+            institution-address: tx-sender,
+            historical-period: historical-period,
+            verification-fee: verification-fee,
+            acquisition-price: acquisition-price,
+            available-for-verification: true,
+            active-verification-count: u0,
+            discovery-height: current-height,
+            min-verification-term: min-term,
+            max-verification-term: max-term,
+            artifact-metadata: artifact-metadata,
+            discovery-location: discovery-location,
+            carbon-dated: carbon-dated
+        }
+    )
+    
+    ;; Update institution's artifact count
+    (map-set cultural-institutions tx-sender
+        (merge institution-info { 
+            artifact-count: (+ (get artifact-count institution-info) u1),
+            last-update-height: current-height
+        })
+    )
+    
+    (var-set total-registered-artifacts (+ new-artifact-id u1))
+    (ok new-artifact-id))
+)
+
+;; Request artifact verification
+(define-public (request-artifact-verification (artifact-id uint) (verification-term uint) (verification-scope (string-ascii 64)))
+    (let (
+        (artifact-info (unwrap! (map-get? cultural-artifacts artifact-id) ERR_ARTIFACT_NOT_FOUND))
+        (institution-info (unwrap! (map-get? cultural-institutions (get institution-address artifact-info)) ERR_RECORD_NOT_FOUND))
+        (verifier-info (unwrap! (map-get? verifiers tx-sender) ERR_UNAUTHORIZED_VERIFIER))
+        (current-height block-height)
+        (annual-fee (get verification-fee artifact-info))
+        (term-fee (* annual-fee verification-term))
+        (platform-fee (calculate-platform-fee term-fee))
+        (institution-payment (- term-fee platform-fee))
+    )
+    (asserts! (not (var-get platform-paused)) ERR_ACCESS_DENIED)
+    (asserts! (get available-for-verification artifact-info) ERR_ARTIFACT_UNAVAILABLE)
+    (asserts! (>= (get reputation-score verifier-info) MIN_VERIFIER_REPUTATION) ERR_UNAUTHORIZED_VERIFIER)
+    (asserts! (and 
+        (>= verification-term (get min-verification-term artifact-info))
+        (<= verification-term (get max-verification-term artifact-info))
+    ) ERR_INVALID_DURATION)
+    
+    ;; Process payment
+    (try! (stx-transfer? term-fee tx-sender (get institution-address artifact-info)))
+    
+    ;; Update verification pool
+    (var-set verification-pool-balance (+ (var-get verification-pool-balance) platform-fee))
+    
+    ;; Update verifier record
+    (map-set verifiers tx-sender
+        (merge verifier-info {
+            has-active-verification: true,
+            verified-artifact-id: artifact-id,
+            verification-scope: verification-scope,
+            annual-fee: annual-fee,
+            verification-start-height: current-height,
+            verification-end-height: (+ current-height (* verification-term BLOCKS_PER_YEAR)),
+            total-verified-artifacts: (+ (get total-verified-artifacts verifier-info) u1),
+            last-verification-height: current-height
+        })
+    )
+    
+    ;; Update artifact verification count
+    (map-set cultural-artifacts artifact-id
+        (merge artifact-info { active-verification-count: (+ (get active-verification-count artifact-info) u1) })
+    )
+    
+    ;; Update institution earnings
+    (map-set cultural-institutions (get institution-address artifact-info)
+        (merge institution-info { 
+            total-earnings: (+ (get total-earnings institution-info) institution-payment),
+            last-update-height: current-height
+        })
+    )
+    
+    (ok true))
+)

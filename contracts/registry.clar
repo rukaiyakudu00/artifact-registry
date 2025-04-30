@@ -319,3 +319,199 @@
     
     (ok true))
 )
+
+;; Submit verification report
+(define-public (submit-verification-report 
+    (payment-amount uint) 
+    (verification-report (string-ascii 256))
+    (verification-methods (string-ascii 128))
+)
+    (let (
+        (verifier-info (unwrap! (map-get? verifiers tx-sender) ERR_UNAUTHORIZED_VERIFIER))
+        (artifact-info (unwrap! (map-get? cultural-artifacts (get verified-artifact-id verifier-info)) ERR_ARTIFACT_NOT_FOUND))
+        (new-record-id (var-get certification-counter))
+        (current-height block-height)
+        (platform-fee (calculate-platform-fee payment-amount))
+        (institution-payment (- payment-amount platform-fee))
+    )
+    (asserts! (not (var-get platform-paused)) ERR_ACCESS_DENIED)
+    (asserts! (get has-active-verification verifier-info) ERR_NO_VERIFICATION)
+    (asserts! (<= current-height (get verification-end-height verifier-info)) ERR_VERIFICATION_EXPIRED)
+    (asserts! (validate-metadata verification-report) ERR_INVALID_METADATA)
+    
+    ;; Process additional payment if provided
+    (when (> payment-amount u0)
+        (try! (stx-transfer? payment-amount tx-sender (get institution-address artifact-info)))
+        
+        ;; Update institution earnings
+        (let ((institution-info (unwrap! (map-get? cultural-institutions (get institution-address artifact-info)) ERR_RECORD_NOT_FOUND)))
+            (map-set cultural-institutions (get institution-address artifact-info)
+                (merge institution-info { 
+                    total-earnings: (+ (get total-earnings institution-info) institution-payment),
+                    last-update-height: current-height
+                })
+            )
+        )
+        
+        ;; Update verification pool
+        (var-set verification-pool-balance (+ (var-get verification-pool-balance) platform-fee))
+    )
+    
+    ;; Create new provenance record
+    (map-set provenance-records new-record-id
+        {
+            verifier-address: tx-sender,
+            payment-amount: payment-amount,
+            status: "VERIFIED",
+            processing-height: current-height,
+            verification-report: verification-report,
+            laboratory: none,
+            verification-duration: u0,
+            verification-methods: verification-methods
+        }
+    )
+    
+    ;; Update reputation score
+    (map-set verifiers tx-sender
+        (merge verifier-info { 
+            reputation-score: (+ (get reputation-score verifier-info) u10),
+            last-verification-height: current-height
+        })
+    )
+    
+    ;; Update counter
+    (var-set certification-counter (+ new-record-id u1))
+    (ok new-record-id))
+)
+
+;; Add laboratory verification
+(define-public (add-laboratory-verification (record-id uint) (laboratory-principal principal) (verification-duration uint))
+    (let (
+        (record-info (unwrap! (map-get? provenance-records record-id) ERR_RECORD_NOT_FOUND))
+        (verifier-info (unwrap! (map-get? verifiers tx-sender) ERR_UNAUTHORIZED_VERIFIER))
+    )
+    (asserts! (not (var-get platform-paused)) ERR_ACCESS_DENIED)
+    (asserts! (is-eq tx-sender (get verifier-address record-info)) ERR_ACCESS_DENIED)
+    (asserts! (is-none (get laboratory record-info)) ERR_ALREADY_PROCESSED)
+    
+    ;; Update provenance record with laboratory info
+    (map-set provenance-records record-id
+        (merge record-info { 
+            laboratory: (some laboratory-principal),
+            verification-duration: verification-duration,
+            status: "LAB_VERIFIED"
+        })
+    )
+    
+    ;; Update verifier reputation for adding lab verification
+    (map-set verifiers tx-sender
+        (merge verifier-info { 
+            reputation-score: (+ (get reputation-score verifier-info) u5)
+        })
+    )
+    
+    (ok true))
+)
+
+;; Transfer artifact ownership
+(define-public (transfer-artifact-ownership (artifact-id uint) (new-owner principal))
+    (let (
+        (artifact-info (unwrap! (map-get? cultural-artifacts artifact-id) ERR_ARTIFACT_NOT_FOUND))
+        (new-institution-info (unwrap! (map-get? cultural-institutions new-owner) ERR_RECORD_NOT_FOUND))
+        (current-institution-info (unwrap! (map-get? cultural-institutions (get institution-address artifact-info)) ERR_RECORD_NOT_FOUND))
+        (current-height block-height)
+        (transfer-fee (calculate-platform-fee (get acquisition-price artifact-info)))
+    )
+    (asserts! (not (var-get platform-paused)) ERR_ACCESS_DENIED)
+    (asserts! (is-eq tx-sender (get institution-address artifact-info)) ERR_ACCESS_DENIED)
+    
+    ;; Process platform fee for transfer
+    (try! (stx-transfer? transfer-fee tx-sender PLATFORM_ADMIN))
+    
+    ;; Update verification pool
+    (var-set verification-pool-balance (+ (var-get verification-pool-balance) transfer-fee))
+    
+    ;; Update artifact ownership
+    (map-set cultural-artifacts artifact-id
+        (merge artifact-info { 
+            institution-address: new-owner,
+            discovery-height: current-height
+        })
+    )
+    
+    ;; Update artifact counts for both institutions
+    (map-set cultural-institutions tx-sender
+        (merge current-institution-info { 
+            artifact-count: (- (get artifact-count current-institution-info) u1),
+            last-update-height: current-height
+        })
+    )
+    
+    (map-set cultural-institutions new-owner
+        (merge new-institution-info { 
+            artifact-count: (+ (get artifact-count new-institution-info) u1),
+            last-update-height: current-height
+        })
+    )
+    
+    (ok true))
+)
+
+;; End verification
+(define-public (end-verification)
+    (let (
+        (verifier-info (unwrap! (map-get? verifiers tx-sender) ERR_UNAUTHORIZED_VERIFIER))
+        (artifact-info (unwrap! (map-get? cultural-artifacts (get verified-artifact-id verifier-info)) ERR_ARTIFACT_NOT_FOUND))
+        (remaining-blocks (- (get verification-end-height verifier-info) block-height))
+        (remaining-years (/ remaining-blocks BLOCKS_PER_YEAR))
+        (refund-amount (* remaining-years (get annual-fee verifier-info)))
+        (platform-fee (calculate-platform-fee refund-amount))
+        (institution-refund (- refund-amount platform-fee))
+    )
+    (asserts! (not (var-get platform-paused)) ERR_ACCESS_DENIED)
+    (asserts! (get has-active-verification verifier-info) ERR_NO_VERIFICATION)
+    
+    ;; Process refund if applicable
+    (when (> institution-refund u0)
+        (try! (stx-transfer? institution-refund (get institution-address artifact-info) tx-sender))
+        
+        ;; Update verification pool balance
+        (var-set verification-pool-balance (- (var-get verification-pool-balance) platform-fee))
+    )
+    
+    ;; Reset verifier active verification status
+    (map-set verifiers tx-sender
+        (merge verifier-info { 
+            has-active-verification: false,
+            verified-artifact-id: u0,
+            verification-scope: "",
+            annual-fee: u0,
+            verification-start-height: u0,
+            verification-end-height: u0,
+            last-verification-height: block-height
+        })
+    )
+    
+    ;; Update artifact verification count
+    (map-set cultural-artifacts (get verified-artifact-id verifier-info)
+        (merge artifact-info { active-verification-count: (- (get active-verification-count artifact-info) u1) })
+    )
+    
+    (ok true))
+)
+
+;; Platform pause/unpause
+(define-public (set-platform-status (new-status bool))
+    (begin
+        (asserts! (check-admin-access) ERR_ADMIN_ONLY)
+        (var-set platform-paused new-status)
+        (ok true))
+)
+
+;; Emergency shutdown
+(define-public (emergency-shutdown)
+    (begin
+        (asserts! (check-admin-access) ERR_ADMIN_ONLY)
+        (var-set platform-paused true)
+        (ok true))
+)
